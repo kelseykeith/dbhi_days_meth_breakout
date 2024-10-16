@@ -1,0 +1,309 @@
+---
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+
+# methylation analysis library
+library(methylSig)
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<br><br>
+
+# Differential Methylation
+
+We'll be performing differential methylation analysis with the goal of identifying CpG sites that change with age in bisulfite sequencing using the `methylSig` library. <https://www.bioconductor.org/packages/release/bioc/vignettes/methylSig/inst/doc/using-methylSig.html> The library has methods to read in the results of different methylation processing pipelines, functions for all the necessary normalization, and several different methods for differential methylation analysis both at single CpGs and as regions of methylation
+
+Like RNA-seq, there are several equivalently good packages and you might also want to try either `methylKit` <https://www.bioconductor.org/packages/release/bioc/html/methylKit.html> which really walks you through the process of differential methylation although it forces you to use only CpGs detected in all samples which is unachieveable at large sample sizes or the `edgeR` methods for differential methylation <https://www.bioconductor.org/packages/devel/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf>
+
+
+-
+
+For this demo, there are six samples, 3 young and 3 old evenly split between sexes. They were all sequenced together in the same Reduced Representation Bisulfite Sequencing (RRBS) library.
+
+| Sample ID | Sex | Age |
+| --- | --- | --- |
+| f24 | female | 24 |
+| f77 | female | 77 |
+| f78 | female | 78 |
+| m22 | male | 22 |
+| m24 | male | 24 |
+| m78 | male | 78 |
+
+---
+
+## Install Packages
+
+If you don't already have `methylSig` install, uncomment in the chunk below and install.
+
+```{r}
+### methylSig
+# BiocManager::install('methylSig')
+```
+
+<br>
+
+## Read / Wrangle Files
+
+### Get the Data
+
+Download the files from the course website <URL HERE> and place them in the working directory of your `.Rmd` file.
+
+### Read Files
+
+`methylSig` uses a `BSseq` object from the `bsseq` package to store the methylatioin data <https://www.bioconductor.org/packages/release/bioc/html/bsseq.html>
+
+```{r}
+# get list of files
+list.files(path = 'data',
+           pattern = '.cov.gz$',
+           full.names = T) -> files
+
+# make a metadata table
+files %>%
+  enframe(name = NULL, value = 'file_path') %>%
+  mutate(sample_id = str_remove_all(file_path, 'data/|_fox_chase.bismark.cov.gz'),
+         age = as.integer(str_remove(sample_id, 'f|m')),
+         cat_age = ifelse(age < 50, 'young', 'old'),
+         sex = str_extract(sample_id, 'f|m')) %>%
+  select(-file_path) %>%
+  as.data.frame() %>%
+  column_to_rownames('sample_id') -> metadata
+
+# read 
+data <- bsseq::read.bismark(files = files,
+                            colData = metadata,
+                            rmZeroCov = FALSE)
+```
+
+#### Data Structure
+
+```{r}
+# metadata dataframe
+bsseq::pData(data)
+
+# CpG locations
+GenomicRanges::granges(data)
+
+# coverage
+bsseq::getCoverage(data, type = 'Cov') %>% head()
+
+# methylation percentages
+bsseq::getMeth(data, type = 'raw') %>% head()
+```
+
+### Filter Data
+
+Before doing any analysis, the data needs quality and biological relevance filtering:
+
+- Filter for coverage greater than or equal to 10
+- CpGs must be present in all samples. As sample size increases, the chance that a particular CpG (especially in RRBS) will be measured at sufficient coverage in all samples decrease rapidly. Recommend making sure it is present in 75% of samples per group.
+- Removing the X, Y, and mitochondrial chromosomes. The mitochondrial chromosome is not methylated but you will detect some false-positives on it. Because of the differences in methylation on the X chromosome if you want to look at it, you need to do it within each biological sex. Sex chromosomes will just be removed entirely for this demo
+
+```{r}
+# filter for at least 10 reads
+data <- filter_loci_by_coverage(data, 
+                                min_count = 10)
+
+# make sure all cpgs are measured in each group. As data sizes increase, the
+# number of CpGs measured in all samples will rapidly decrease so I recommend
+# making sure CpGs are measured in 75% of the samples in the group
+data <- filter_loci_by_group_coverage(data, 
+                                      group_column = 'cat_age',
+                                      min_samples_per_group = c('young' = 3, 'old' = 3))
+
+# remove sex chromosomes and mitochondrial chromosome
+# chromosome sizes are from UCSC https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg38&chromInfoPage=
+remove <- GenomicRanges::GRanges(seqnames = c('chrX', 'chrY', 'chrM'),
+                                 ranges = IRanges::IRanges(
+                                   start = c(1, 1, 1),
+                                   end = c(156040895, 59033248, 16569)))
+data <- filter_loci_by_location(data, remove)
+```
+
+<br>
+
+---
+
+<br>
+
+## Check Quality
+
+### Coverage
+
+If the number of reads sequenced is too low, would need to sequence more.
+
+```{r}
+bsseq::getCoverage(data, type = 'Cov') %>% 
+  as.data.frame() %>%
+  pivot_longer(1:6, names_to = 'sample_id', values_to = 'coverage') %>%
+ggplot(aes(x = coverage)) +
+  geom_histogram(fill = 'deepskyblue3', color = 'black', bins = 25) +
+  facet_wrap(~ sample_id) +
+  theme_classic(base_size = 20) +
+  theme(axis.text.x = element_text(size = 14))
+```
+
+### Percent Methylation
+
+The methylation percentage should follow a bimodal distribution, with peaks at 0% and 100%. If it doesn't, there's a problem with that sample and it should be corrected or excluded.
+
+```{r}
+bsseq::getMeth(data, type = 'raw') %>% 
+  as.data.frame() %>%
+  pivot_longer(1:6, names_to = 'sample_id', values_to = 'meth_percent') %>%
+  mutate(meth_percent = round(meth_percent * 100)) %>%
+ggplot(aes(x = meth_percent)) +
+  geom_histogram(fill = 'forestgreen', color = 'black', bins = 25) +
+  facet_wrap(~ sample_id) +
+  labs(x = 'Percent Methylation') +
+  theme_classic(base_size = 20)
+```
+
+### PCA
+
+Check for batch, sex, or. other unwanted effects
+
+```{r}
+### calculate the PCA
+GenomicRanges::granges(data) %>% 
+  as_tibble() %>% 
+  dplyr::select(seqnames, start) %>%
+  unite(chr_base, c(seqnames, start), sep = '_') %>%
+  cbind(as.data.frame(bsseq::getMeth(data, type = 'raw'))) %>% 
+  column_to_rownames('chr_base') %>%
+  na.omit() %>%
+  t() %>% 
+# To calculate the PCA, we will center the data, but not scale it, because 
+# methylation data is already scaled from 0% to 100%.
+  prcomp(center = T, scale = F) -> pca_data
+
+### format results for plotting
+# Get the percent variance explained by each PC and save it to a table for
+# plotting
+tibble(var_explained = ((pca_data$sdev) ^ 2 / (sum(pca_data$sdev ^ 2)))) %>%
+  mutate(PC = colnames(pca_data$x)) -> pca_data_scree
+
+# The coordinates to plot the PCA are in the x table of the PCA object.
+pca_data$x %>%
+  as.data.frame() %>%
+  rownames_to_column('sample_id') %>%
+# Add variables back in to color by.
+  mutate(sex = ifelse(str_detect(sample_id, 'f'), 'female', 'male'),
+         age = as.integer(str_extract(sample_id, '\\d+')),
+         age_cat = ifelse(age <= 35, 'young', 'old')) -> pca_data_pcs
+```
+
+```{r, fig.width = 4, fig.height = 3}
+### plot
+# PCA colored by age
+ggplot(pca_data_pcs, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = age_cat), size = 6) +
+  scale_color_manual(name = 'age', values = c('forestgreen', 'gold3')) +
+#  ggrepel::geom_label_repel(aes(label = sample_id)) +
+  theme_classic()
+
+# PCA colored by sex
+ggplot(pca_data_pcs, aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = sex), size = 6) +
+  scale_color_manual(values = c('hotpink3', 'dodgerblue3')) +
+#  ggrepel::geom_label_repel(aes(label = sample_id)) +
+  theme_classic()
+```
+
+<br>
+
+---
+
+<br>
+
+## Test
+
+Other options:
+
+- `diff_binomial()` implementation of the test from `methylKit`
+- `diff_methylsig()` beta-binomial test similar to `edgeR`
+
+
+```{r}
+### fit model
+diff_fit <- diff_dss_fit(bs = data,
+                         design = select(as.data.frame(bsseq::pData(data)),
+                                         cat_age),
+                         formula = as.formula('~ cat_age'))
+
+### can look at the contrasts
+diff_fit$X
+
+### test
+diff_gr <- diff_dss_test(bs = data,
+                         diff_fit = diff_fit,
+                         contrast = matrix(c(0, 1)),
+                         methylation_group_column = 'cat_age',
+                         methylation_groups = c('case' = 'old', 'control' = 'young'))
+```
+
+
+### Examine Results
+
+```{r}
+diff_gr %>% class()
+
+diff_gr %>%
+  as_tibble()
+```
+
+### Visualize Results with a Volcano Plot
+
+Remember, a volcano plot is a type of scatterplot with the difference in values plotted on the x-axis and the significance of those values plotted on the y-axis. For the linear model methylation, we'll plot the change in percent methylation, the estimate column in the tables and the log qvalue on the y-axis.
+
+```{r, fig.width = 6, fig.height = 6}
+# Create labels for the number and percentage of significantly up- and down- 
+# regulated genes
+diff_gr %>%
+  as_tibble() %>%
+  mutate(direction = ifelse(meth_diff < 0, 'down', 'up'),
+         sig = ifelse(fdr < 0.05, 'sig', 'notsig')) %>%
+  group_by(direction, sig) %>%
+  dplyr::count() %>%
+  ungroup() %>%
+  complete(direction, sig, fill = list(n = 0)) %>%
+  na.omit() %>%
+  filter(sig == 'sig') %>%
+  mutate(label = paste0(n, ', ', round((n / nrow(as_tibble(diff_gr))), 1), '%'),
+# Remember, these numbers indicate the x- and y- positions of your labels and
+# will need manually adjustment based on the plot
+         meth_diff = c(-50, 50),
+         log_fdr = 8) -> volc_labels_lms
+
+# plot
+diff_gr %>%
+  as_tibble() %>%
+  mutate(log_fdr = -log10(fdr),
+         sig = ifelse(fdr < 0.05, 'sig', 'notsig')) %>%
+ggplot(aes(x = meth_diff, y = log_fdr)) +
+  geom_point(aes(color = sig)) +
+  scale_color_manual(values = c('gray30', 'firebrick3')) +
+  geom_hline(yintercept = -log10(0.05), color = 'gray60', linetype = 'dashed') +
+  geom_vline(xintercept = c(-0.1, 0.1), color = 'gray60', linetype = 'dashed') +
+  geom_text(data = volc_labels_lms, aes(label = label), size = 8) +
+  labs(x = 'Change in % Methylation per Year', y = '-Log10 P-Value') +
+  coord_cartesian(ylim = c(0, 10)) +
+  theme_classic(base_size = 20) +
+  theme(legend.position = 'none')
+```
+
+<br><br>
+
+
+
+
+
+
+
+
+
+
