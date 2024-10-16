@@ -1,0 +1,8 @@
+# files to ignore
+.DS_Store
+
+# file types to ignore
+*.pptx
+
+# folders to ignore
+02_analysis/data/
